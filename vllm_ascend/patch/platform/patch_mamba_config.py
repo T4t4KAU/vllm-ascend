@@ -145,5 +145,24 @@ def verify_and_update_config(cls, vllm_config) -> None:
     else:
         cache_config.mamba_block_size = model_config.max_model_len
 
+    if cache_config.mamba_cache_mode == "align" and model_config.max_model_len >= cache_config.block_size:
+        # Validate after deriving the hardware-dependent attention block size.
+        # The scheduler rounds intermediate prefills down to whole blocks;
+        # a smaller per-request cap (or total budget) prevents forward progress.
+        scheduler_config = vllm_config.scheduler_config
+        threshold = scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < cache_config.block_size:
+            raise ValueError(
+                f"long_prefill_token_threshold ({threshold}) must be 0 (uncapped) "
+                f"or at least the resolved block_size ({cache_config.block_size}) "
+                "when mamba_cache_mode='align'; smaller chunks cannot make prefill progress."
+            )
+        if scheduler_config.max_num_batched_tokens < cache_config.block_size:
+            raise ValueError(
+                f"max_num_batched_tokens ({scheduler_config.max_num_batched_tokens}) "
+                f"must be at least the resolved block_size ({cache_config.block_size}) "
+                "when mamba_cache_mode='align'; smaller budgets cannot make prefill progress."
+            )
+
 
 vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config
