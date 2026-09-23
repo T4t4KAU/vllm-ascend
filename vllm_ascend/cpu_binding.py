@@ -199,7 +199,14 @@ class DeviceInfo:
                     continue
                 last_part = parts[-1]
                 if self.is_cpu_list(last_part):
-                    affinity[int(npu_match.group(1))] = self.expand_cpu_list(last_part)
+                    npu_id = npu_match.group(1)
+                    chip_map = self.npu_map_info.get(npu_id, {})
+                    # Single-chip boards use physical NPU IDs in the topology
+                    # table, but the allocator and visible-device list use
+                    # chip logic IDs. Containers can remap e.g. NPU4 to 0.
+                    # Preserve the existing labels for multi-chip topologies.
+                    logic_id = self.resolve_logic_id(npu_id, None) if len(chip_map) == 1 else int(npu_id)
+                    affinity[logic_id] = self.expand_cpu_list(last_part)
         return affinity
 
 

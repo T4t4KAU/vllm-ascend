@@ -90,6 +90,12 @@ degrade latency or throughput.**
 For optimal locality, use a cpuset that is evenly distributed across NUMA
 nodes. Unbalanced cpusets may reduce the locality benefit of CPU binding.
 
+On single-chip boards, topology rows are converted from physical NPU IDs to
+the chip logical IDs reported by `npu-smi info -m`. For example, a container
+can expose physical NPU4 and NPU5 as logical devices 0 and 1. Their topology
+affinity must follow this mapping before it is matched against the worker's
+visible devices and allowed CPUs.
+
 On Ascend 950, CPU binding uses deterministic global CPU slicing because Ascend 950 does not
 report NPU-to-CPU affinity in `npu-smi info -t topo`. Ascend 950 still pins worker,
 ACL, and release threads and can still migrate memory pages when `migratepages`

@@ -221,6 +221,7 @@ class TestDeviceInfo(unittest.TestCase):
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_parse_topo_affinity_skips_affinity_header_and_non_npu_rows(self, mock_execute_command):
         device_info = object.__new__(DeviceInfo)
+        device_info.npu_map_info = {}
         mock_execute_command.return_value = (
             "HEADER\nNPU Chip Affinity\nnot-an-npu row\nNPU0 x x x 2-3",
             0,
@@ -231,6 +232,7 @@ class TestDeviceInfo(unittest.TestCase):
     @patch("vllm_ascend.cpu_binding.execute_command")
     def test_parse_topo_affinity_skips_topo_matrix_without_cpu_affinity(self, mock_execute_command):
         device_info = object.__new__(DeviceInfo)
+        device_info.npu_map_info = {}
         mock_execute_command.return_value = (
             "       NPU0       NPU1       NIC0\n"
             "NPU0       X          UB         NA\n"
@@ -240,6 +242,40 @@ class TestDeviceInfo(unittest.TestCase):
         )
 
         self.assertEqual(device_info.parse_topo_affinity(), {})
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_parse_topo_affinity_remaps_container_physical_ids(self, mock_execute_command):
+        self.device_info.npu_map_info = {"4": {"0": "0"}, "5": {"0": "1"}}
+        mock_execute_command.return_value = ("       NPU4 NPU5 CPU Affinity\nNPU4 X HCCS 96-119\nNPU5 HCCS X 48-71", 0)
+        affinity = self.device_info.parse_topo_affinity()
+        self.assertEqual(affinity, {0: list(range(96, 120)), 1: list(range(48, 72))})
+        # The allocator must find a disjoint pool for each independently
+        # visible DP worker, using its logical rather than physical ID.
+        for visible in ([0], [1]):
+            alloc = make_cpu_alloc()
+            alloc.device_info.running_npu_list = visible
+            alloc.device_info.all_logic_npus = [0, 1]
+            alloc.device_info.allowed_cpus = list(range(192))
+            alloc.device_info.npu_affinity = affinity
+            with (
+                patch.object(alloc, "build_cpu_node_map"),
+                patch.object(alloc, "extend_numa", side_effect=lambda cpus: cpus),
+                patch.object(alloc, "_binding_mode", return_value="topo_affinity"),
+            ):
+                alloc.build_cpu_pools()
+            self.assertEqual(alloc.npu_cpu_pool, {visible[0]: affinity[visible[0]]})
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_parse_topo_affinity_handles_reordered_logical_ids(self, mock_execute_command):
+        self.device_info.npu_map_info = {"0": {"0": "1"}, "1": {"0": "0"}}
+        mock_execute_command.return_value = ("NPU0 X HCCS 0-7\nNPU1 HCCS X 8-15", 0)
+        self.assertEqual(self.device_info.parse_topo_affinity(), {1: list(range(8)), 0: list(range(8, 16))})
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_parse_topo_affinity_preserves_multi_chip_labels(self, mock_execute_command):
+        self.device_info.npu_map_info = {"0": {"0": "0", "1": "1"}}
+        mock_execute_command.return_value = ("NPU0 X HCCS 0-7\nNPU1 HCCS X 8-15", 0)
+        self.assertEqual(self.device_info.parse_topo_affinity(), {0: list(range(8)), 1: list(range(8, 16))})
 
     def test_resolve_logic_id_from_npu_only_single_chip_map(self):
         device_info = object.__new__(DeviceInfo)
