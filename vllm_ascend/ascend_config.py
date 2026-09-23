@@ -15,10 +15,13 @@
 # limitations under the License.
 import json
 import os
+from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
+
+from vllm_ascend.core.mamba_retention import MambaRetentionConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -32,6 +35,13 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+
+        self.mamba_cache_retention = MambaRetentionConfig(**additional_config.get("mamba_cache_retention", {}))
+        if self.mamba_cache_retention.interval is not None or self.mamba_cache_retention.diagnostics:
+            if version("vllm").split("+")[0] != "0.22.1":
+                raise ValueError("mamba_cache_retention currently requires vLLM 0.22.1")
+            if vllm_config.model_config.architecture != "Qwen3_5ForConditionalGeneration":
+                raise ValueError("mamba_cache_retention currently requires Qwen3.5")
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
         self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)

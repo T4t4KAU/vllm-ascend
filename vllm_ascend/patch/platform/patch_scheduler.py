@@ -1,6 +1,8 @@
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
+from vllm_ascend.core.mamba_retention import cap_at_checkpoint, reuse_boundaries
+
 
 def _mamba_block_aligned_split(
     self,
@@ -25,6 +27,13 @@ def _mamba_block_aligned_split(
         # matching block. To prevent this from causing a Mamba cache miss, the
         # last chunk must be not smaller than `block_size`.
         block_size = self.cache_config.block_size
+        manager = getattr(self, "kv_cache_manager", None)
+        state = getattr(getattr(manager, "block_pool", None), "ascend_mamba_retention", None)
+        if state is not None and state.config.interval is not None:
+            boundaries = reuse_boundaries(
+                request.num_prompt_tokens, block_size, getattr(request, "ascend_mamba_shared_boundary", 0)
+            )
+            num_new_tokens = cap_at_checkpoint(num_computed_tokens, num_new_tokens, state.config.interval, boundaries)
         last_cache_position = request.num_tokens - request.num_tokens % block_size
         # eagle prune
         if self.use_eagle:
