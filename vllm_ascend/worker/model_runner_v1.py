@@ -3184,6 +3184,18 @@ class NPUModelRunner(GPUModelRunner):
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
+            if (
+                self.ascend_config.fork_attention.enabled
+                and not for_cudagraph_capture
+                and not self.use_cp
+                and ubatch_slices is None
+                and self.speculative_config is None
+            ):
+                # Expose the existing CPU kernel-page table; planning remains
+                # in the attention metadata builder and runs once per KV group.
+                cm.fork_block_table_cpu = (
+                    self.input_batch.block_table[kv_cache_gid].get_cpu_tensor()[:num_reqs]
+                )
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
             cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.attention.fork_batch import ForkAttentionConfig
 from vllm_ascend.core.mamba_retention import MambaRetentionConfig
 
 if TYPE_CHECKING:
@@ -35,6 +36,28 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+
+        self.fork_attention = ForkAttentionConfig(**additional_config.get("fork_attention", {}))
+        if self.fork_attention.enabled:
+            if version("vllm").split("+")[0] != "0.22.1":
+                raise ValueError("fork_attention currently requires vLLM 0.22.1")
+            if vllm_config.model_config.architecture != "Qwen3_5ForConditionalGeneration":
+                raise ValueError("fork_attention serving currently requires Qwen3.5")
+            parallel = vllm_config.parallel_config
+            if (
+                any(
+                    getattr(parallel, name) != 1
+                    for name in (
+                        "tensor_parallel_size",
+                        "pipeline_parallel_size",
+                        "prefill_context_parallel_size",
+                        "decode_context_parallel_size",
+                    )
+                )
+                or vllm_config.speculative_config is not None
+                or parallel.enable_dbo
+            ):
+                raise ValueError("fork_attention requires TP1/PP1, no context parallelism, speculative decoding or DBO")
 
         self.mamba_cache_retention = MambaRetentionConfig(**additional_config.get("mamba_cache_retention", {}))
         if self.mamba_cache_retention.interval is not None or self.mamba_cache_retention.diagnostics:

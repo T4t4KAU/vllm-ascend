@@ -23,6 +23,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -42,6 +43,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
+from vllm_ascend.attention.fork_batch import MAX_BATCH, ForkAttentionConfig, ForkBatchPlan, ForkBatchPlanner
 from vllm_ascend.attention.kvcomp_attn.attention_utils import (
     get_kvcomp_decode_params,
     is_enable_hamming_sparse,
@@ -62,6 +64,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend.ops.fork_decode import ForkCapturedAttention, ForkDecodeBuffers
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
@@ -209,6 +212,9 @@ class AscendMetadata:
 
     kvcomp_metadata: KVCompMetaData | None = None
 
+    fork_plan: ForkBatchPlan | None = None
+    fork_buffers: ForkDecodeBuffers | None = None
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -255,6 +261,28 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        self.fork_config = ForkAttentionConfig(**(vllm_config.additional_config or {}).get("fork_attention", {}))
+        self.fork_planner = ForkBatchPlanner(self.fork_config) if self.fork_config.enabled else None
+        self.fork_buffers = None
+        self.fork_batches = self.fork_selected = 0
+        if self.fork_config.enabled and not isinstance(kv_cache_spec, CrossAttentionSpec):
+            heads = self.model_config.get_num_attention_heads(vllm_config.parallel_config)
+            if (
+                heads == 16
+                and kv_cache_spec.num_kv_heads == 4
+                and kv_cache_spec.head_size == 256
+                and kv_cache_spec.dtype in (torch.bfloat16, torch.float16)
+                and getattr(kv_cache_spec, "sliding_window", None) is None
+            ):
+                self.fork_buffers = ForkDecodeBuffers(
+                    device,
+                    kv_cache_spec.dtype,
+                    heads,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    self.model_config.max_model_len,
+                    self.fork_config.diagnostics,
+                )
 
     @classmethod
     def get_cudagraph_support(
@@ -329,6 +357,31 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
         )
+        attn_metadata.fork_buffers = self.fork_buffers
+        cpu_table = common_attn_metadata.fork_block_table_cpu
+        actual = num_actual_tokens
+        if (
+            self.fork_buffers is not None
+            and cpu_table is not None
+            and attn_state == AscendAttentionState.DecodeOnly
+            and common_attn_metadata.causal
+            and self.speculative_config is None
+            and 2 <= actual <= MAX_BATCH
+            and len(cpu_table) == actual
+            and attn_metadata.actual_seq_lengths_q[:actual] == list(range(1, actual + 1))
+        ):
+            attn_metadata.fork_plan = self.fork_planner.build(cpu_table.numpy(), attn_metadata.seq_lens_list[:actual])
+            self.fork_batches += 1
+            selected = attn_metadata.fork_plan is not None
+            self.fork_selected += int(selected)
+            if self.fork_config.diagnostics and (self.fork_batches % 256 == 0 or selected and self.fork_selected == 1):
+                logger.info(
+                    "ForkAttention planner batches=%d selected=%d plan_rebuilds=%d plan_reuses=%d",
+                    self.fork_batches,
+                    self.fork_selected,
+                    self.fork_planner.rebuilds,
+                    self.fork_planner.reuses,
+                )
         return attn_metadata
 
     def build_for_graph_capture(
@@ -351,6 +404,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             )
 
         attn_metadata.attn_state = attn_state
+        if self.fork_buffers is not None:
+            self.fork_buffers.prepare(attn_metadata)
         return attn_metadata
 
 
@@ -378,6 +433,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.hidden_size = self.num_heads * self.head_size
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
+        self.fork_supports_logits = logits_soft_cap is None or logits_soft_cap == 0
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
         self.alibi_slopes = alibi_slopes
@@ -396,6 +452,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
+
+    def _can_use_fork(self, query, metadata):
+        return (
+            metadata.fork_buffers is not None
+            and metadata.attn_state == AscendAttentionState.DecodeOnly
+            and metadata.causal
+            and 2 <= query.shape[0] <= MAX_BATCH
+            and self.sliding_window is None
+            and self.alibi_slopes is None
+            and self.fork_supports_logits
+            and self.sinks is None
+            and not _EXTRA_CTX.sinks
+            and not self.enable_c8_quant
+            and not self.enable_hamming_sparse
+            and self.attn_type == AttentionType.DECODER
+            and not _EXTRA_CTX.is_draft_model
+            and self.key_cache is not None
+            and self.key_cache.shape[1] == 128
+            and query.dtype == metadata.fork_buffers.packed.dtype
+            and query.is_contiguous()
+            and self.key_cache.is_contiguous()
+            and self.value_cache.is_contiguous()
+        )
 
     @staticmethod
     def update_graph_params(
@@ -590,6 +669,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     graph_params.handles[num_tokens],
                     graph_params.events[num_tokens],
                 ):
+                    if isinstance(param, ForkCapturedAttention):
+                        param.update(attn_metadata[key], update_stream, handle, event)
+                        continue
                     (
                         query,
                         key_cache,
@@ -768,6 +850,33 @@ class AscendAttentionBackendImpl(AttentionImpl):
         event.wait(stream)
         event.reset(stream)
         graph_params.events[num_tokens].append(event)
+        if self._can_use_fork(query, attn_metadata):
+            record = ForkCapturedAttention(
+                attn_metadata.fork_buffers,
+                query,
+                key,
+                value,
+                output,
+                dict(
+                    atten_mask=attn_mask,
+                    block_table=block_table,
+                    input_layout=input_layout,
+                    block_size=block_size,
+                    actual_seq_lengths=actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale=self.scale,
+                    sparse_mode=sparse_mode,
+                    pre_tokens=pre_tokens,
+                    next_tokens=next_tokens,
+                ),
+                softmax_lse,
+                workspace,
+            )
+            graph_params.attn_params[num_tokens].append(record)
+            graph_params.handles[num_tokens].append(record.capture(stream))
+            return output.view(num_tokens, self.num_heads, self.head_size), num_tokens
         attn_params = (
             weak_ref_tensors(query),
             weak_ref_tensors(key),
@@ -1067,6 +1176,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
+        if attn_metadata.fork_plan is not None and self._can_use_fork(query, attn_metadata):
+            return attn_metadata.fork_buffers.run(query, key, value, output, attn_metadata, self.scale)
         if self.enable_hamming_sparse and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
             reshape_and_cache_kvcomp(attn_metadata.kvcomp_metadata, self.layerIndex, passed_key)
         elif self.enable_hamming_sparse:
