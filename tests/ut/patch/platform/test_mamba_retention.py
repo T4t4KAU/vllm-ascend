@@ -7,7 +7,7 @@ import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec
 
 from vllm_ascend.core.mamba_retention import MambaRetentionConfig, MambaRetentionState
@@ -78,7 +78,11 @@ def prefill(manager, req, cap=4, finish=True):
         for group in manager.coordinator.single_type_managers:
             group.new_step_starts()
         req.num_computed_tokens = computed
-        count = Scheduler._mamba_block_aligned_split(scheduler, req, min(cap, req.num_tokens - computed))
+        # Platform initialization replaces Scheduler; resolve the runtime class
+        # after patch loading, including when this test runs without conftest.
+        count = scheduler_module.Scheduler._mamba_block_aligned_split(
+            scheduler, req, min(cap, req.num_tokens - computed)
+        )
         assert count > 0
         # Use the real admission/allocation path, including cached state refs.
         if not chunks:

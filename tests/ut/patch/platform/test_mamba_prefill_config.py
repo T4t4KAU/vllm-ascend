@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched import scheduler as scheduler_module
 
 from vllm_ascend.patch.platform import patch_mamba_config
 
@@ -97,5 +97,5 @@ def test_checks_mode_enabled_by_store_connector(verify):
 def test_scheduler_cannot_advance_sub_block_chunk():
     scheduler = SimpleNamespace(cache_config=SimpleNamespace(block_size=1024), use_eagle=False)
     request = SimpleNamespace(num_computed_tokens=0, num_prompt_tokens=4096, num_tokens=4096)
-    assert Scheduler._mamba_block_aligned_split(scheduler, request, 512) == 0
-    assert Scheduler._mamba_block_aligned_split(scheduler, request, 1024) == 1024
+    assert scheduler_module.Scheduler._mamba_block_aligned_split(scheduler, request, 512) == 0
+    assert scheduler_module.Scheduler._mamba_block_aligned_split(scheduler, request, 1024) == 1024
