@@ -131,10 +131,7 @@ def test_serving_pool_long_prefix_matches_native_fia(batch, prefix):
     v = torch.randn_like(k)
     table = torch.tensor(rows, device="npu")
     mask = torch.triu(torch.ones((2048, 2048), device="npu", dtype=torch.bool), 1)
-    reference, _ = torch_npu.npu_fused_infer_attention_score(
-        q,
-        k,
-        v,
+    kwargs = dict(
         block_table=table,
         block_size=block,
         actual_seq_lengths=list(range(1, batch + 1)),
@@ -146,6 +143,7 @@ def test_serving_pool_long_prefix_matches_native_fia(batch, prefix):
         sparse_mode=3,
         input_layout="TND",
     )
+    reference, _ = torch_npu.npu_fused_infer_attention_score(q, k, v, **kwargs)
     planner = ForkBatchPlanner(ForkAttentionConfig(enabled=True))
     plan = planner.build(rows, lengths)
     assert plan is not None
@@ -153,3 +151,42 @@ def test_serving_pool_long_prefix_matches_native_fia(batch, prefix):
     output = torch.empty_like(q)
     buffers.run(q, k, v, output, SimpleNamespace(fork_plan=plan), dim**-0.5)
     torch.testing.assert_close(output.cpu().float(), reference.cpu().float(), atol=2e-3, rtol=2e-2)
+
+    # Exercise serving's update-after-replay ordering at the same long prefixes,
+    # including a native fallback between two shared executions on one graph.
+    buffers.prepare(SimpleNamespace(fork_plan=None))
+    lse = torch.empty(1, dtype=q.dtype, device=q.device)
+    workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(q, k, v, **kwargs)
+    record = ForkCapturedAttention(buffers, q, k, v, output, kwargs, lse, workspace)
+    record.attention()
+    torch.npu.synchronize()
+    graph, stream = torch.npu.NPUGraph(), torch.npu.current_stream()
+    event = torch.npu.ExternalEvent()
+    with torch.npu.graph(graph):
+        capture_stream = torch.npu.current_stream()
+        event.wait(capture_stream)
+        event.reset(capture_stream)
+        handle = record.capture(capture_stream)
+    update_stream = torch.npu.Stream()
+    for offset, use_fork in ((0, True), (1, False), (-1, True)):
+        q.normal_()
+        current_lengths = [length + offset for length in lengths]
+        # Mutate a private page and its mapping so stale descriptors/KV are visible.
+        rows[0, -2:] = rows[0, -2:][::-1].copy()
+        table.copy_(torch.from_numpy(rows))
+        v[int(rows[0, -1])].normal_()
+        native_kwargs = dict(kwargs, actual_seq_lengths_kv=current_lengths)
+        expected, _ = torch_npu.npu_fused_infer_attention_score(q, k, v, **native_kwargs)
+        metadata = SimpleNamespace(
+            fork_plan=planner.build(rows, current_lengths) if use_fork else None,
+            block_tables=table,
+            actual_seq_lengths_q=list(range(1, batch + 1)),
+            seq_lens_list=current_lengths,
+        )
+        if use_fork:
+            assert metadata.fork_plan is not None
+        stream.synchronize()
+        graph.replay()
+        with torch.npu.stream(update_stream):
+            record.update(metadata, update_stream, handle, event)
+        torch.testing.assert_close(output.cpu().float(), expected.cpu().float(), atol=2e-3, rtol=2e-2)
