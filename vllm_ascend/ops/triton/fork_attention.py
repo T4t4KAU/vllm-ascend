@@ -61,23 +61,32 @@ def merge_fork_batch(
     DIM: tl.constexpr,
     PARTS: tl.constexpr,
     PAD_PARTS: tl.constexpr,
+    HEAD_TILE: tl.constexpr = 1,
 ):
+    # Keep DIM contiguous in FIA's [partial, head, dim] output. Adjacent heads
+    # share descriptor loads, but each head retains its own softmax normalizer.
+    # HEAD_TILE=1 remains available for comparisons with the original grid.
     # Count == 0 is the native FIA path; native output must remain untouched.
     if tl.load(Count) > 0:
-        query, head = tl.program_id(0), tl.program_id(1)
+        query = tl.program_id(0)
+        heads = tl.program_id(1) * HEAD_TILE + tl.arange(0, HEAD_TILE)
         parts = tl.arange(0, PAD_PARTS)
         indices = tl.load(MergeMap + query * PARTS + parts, mask=parts < PARTS, other=-1)
-        valid = indices >= 0
-        lse = tl.load(PartialLSE + indices * HEADS + head, mask=valid, other=-float("inf"))
+        valid = (indices[:, None] >= 0) & (heads[None, :] < HEADS)
+        lse = tl.load(PartialLSE + indices[:, None] * HEADS + heads[None, :], mask=valid, other=-float("inf"))
         # Padded model graph queries have no partials. Write zero, not NaN.
         maximum = tl.maximum(tl.max(lse, 0), -1.0e30)
-        weights = tl.exp(lse - maximum)
+        weights = tl.exp(lse - maximum[None, :])
         denominator = tl.maximum(tl.sum(weights, 0), 1.0e-30)
         dims = tl.arange(0, DIM)
         values = tl.load(
-            PartialOut + (indices[:, None] * HEADS + head) * DIM + dims[None, :],
-            mask=valid[:, None],
+            PartialOut + (indices[:, None, None] * HEADS + heads[None, :, None]) * DIM + dims[None, None, :],
+            mask=valid[:, :, None],
             other=0,
         ).to(tl.float32)
-        result = tl.sum(values * weights[:, None], 0) / denominator
-        tl.store(Out + (query * HEADS + head) * DIM + dims, result)
+        result = tl.sum(values * weights[:, :, None], 0) / denominator[:, None]
+        tl.store(
+            Out + (query * HEADS + heads[:, None]) * DIM + dims[None, :],
+            result,
+            mask=heads[:, None] < HEADS,
+        )

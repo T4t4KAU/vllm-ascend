@@ -184,3 +184,49 @@ Similarly, let's take `Qwen2.5-VL-7B-Instruct` benchmark as an example:
   --model Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size 1 \
   --load-format dummy --num-iters-warmup 5 --num-iters 15
   ```
+
+### ForkAttention merge layout exploration
+
+`ops/benchmark_fork_merge.py` compares independent LSE merge references with the
+installed serving kernel. Serving now uses two adjacent heads per program and
+keeps the head dimension contiguous. The references retain one-, two-, and
+four-head grids with two reduction layouts. Larger head groups reduce the
+program count but enlarge the FP32 working set. The serving choice is an
+implementation decision; no additional NPU performance result is claimed.
+
+An arithmetic preflight can run without accelerator hardware:
+
+```shell
+TRITON_INTERPRET=1 python benchmarks/ops/benchmark_fork_merge.py \
+  --check-only --check-device cpu
+```
+
+This checks the independent references for FP32/FP16 arithmetic, descriptor
+changes, head masks, padded queries, large positive/negative LSE, and native
+fallback. It does not execute the installed serving kernel or validate Ascend
+compilation, BF16 execution, ACLGraph, or performance.
+
+On an idle NPU, activate the matching CANN, Triton-Ascend, and vLLM environment
+and write raw measurements to a server experiment directory:
+
+```shell
+python benchmarks/ops/benchmark_fork_merge.py \
+  --device 0 --branches 4 8 --prefix 32768 65536 --tail 128 1024 \
+  --seeds 71 79 --iterations 100 --dtype bfloat16 \
+  --output "${RESULTS_DIR}/fork-merge-card0-bf16.json"
+```
+
+Repeat on the second NPU and use `--dtype float16` for a separate dtype sweep.
+The NPU run first checks BF16/FP16 arithmetic, then validates full attention
+against native FIA, checks replay with changed Q/KV, and verifies that a captured
+merge preserves native output when disabled. It records merge-only and full
+pack/FIA/merge graph times separately, with balanced forward/reverse orders.
+The online-sized buffers use 136 packed rows and eight padded output rows.
+
+Output files record source digests, the serving Q-copy and head-group sizes,
+raw timing rounds, and FIA workspace size. Existing files are never overwritten. A failed or
+interrupted run remains incomplete and must not be counted as a successful
+performance result. Performance claims require NPU correctness, improved
+complete-path timing across the relevant shapes, and a separate concurrent
+model comparison; CPU preflight or merge-only speedups do not establish online
+gains.

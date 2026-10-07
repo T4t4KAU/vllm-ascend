@@ -7,9 +7,11 @@ import numpy as np
 import pytest
 import torch
 import torch_npu
+from vllm.triton_utils import triton
 
 from vllm_ascend.attention.fork_batch import ForkAttentionConfig, ForkBatchPlanner
-from vllm_ascend.ops.fork_decode import ForkCapturedAttention, ForkDecodeBuffers
+from vllm_ascend.ops.fork_decode import MERGE_HEAD_TILE, ForkCapturedAttention, ForkDecodeBuffers
+from vllm_ascend.ops.triton.fork_attention import merge_fork_batch
 
 
 def dense_reference(query, key, value, rows, lengths):
@@ -21,6 +23,64 @@ def dense_reference(query, key, value, rows, lengths):
         logits = torch.einsum("hd,hsd->hs", q.float(), k) * query.shape[-1] ** -0.5
         outputs.append(torch.einsum("hs,hsd->hd", logits.softmax(-1), v))
     return torch.stack(outputs)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("heads", [7, 16])
+def test_grouped_merge_replay_with_head_masks_and_sparse_partials(dtype, heads):
+    """Merge real partials; padded slots and native fallback must not leak NaNs."""
+    generator = torch.Generator().manual_seed(223)
+    batch, capacity, parts, dim = 8, 136, 17, 256
+    values = torch.randn(capacity, heads, dim, generator=generator).to(dtype)
+    lse = torch.randn(capacity, heads, generator=generator) * 10 + 1000
+    values[-1] = float("nan")
+    lse[-1] = float("nan")
+    mapping = torch.full((batch, parts), -1, dtype=torch.int32)
+    for query, size in enumerate((1, 5, 17, 3)):
+        slots = torch.randperm(parts, generator=generator)[:size]
+        mapping[query, slots] = torch.randperm(capacity - 1, generator=generator)[:size].int()
+    vn, ln, mn = values.npu(), lse.npu(), mapping.npu()
+    count = torch.tensor([int((mapping >= 0).sum())], dtype=torch.int32, device="npu")
+    output = torch.empty(batch, heads, dim, dtype=dtype, device="npu")
+
+    def merge():
+        merge_fork_batch[(batch, triton.cdiv(heads, MERGE_HEAD_TILE))](
+            vn, ln, output, mn, count, heads, dim, parts, triton.next_power_of_2(parts), MERGE_HEAD_TILE
+        )
+
+    for _ in range(3):
+        merge()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        merge()
+
+    for step in range(2):
+        if step:
+            values[:-1].neg_()
+            lse[:-1].sub_(2000)
+            mapping = mapping.flip(0).contiguous()
+            vn.copy_(values)
+            ln.copy_(lse)
+            mn.copy_(mapping)
+        expected = torch.zeros(batch, heads, dim, dtype=torch.float64)
+        for query in range(batch):
+            indices = mapping[query][mapping[query] >= 0].long()
+            if indices.numel():
+                weights = lse[indices].double().softmax(0)
+                expected[query] = (values[indices].double() * weights[:, :, None]).sum(0)
+        count.fill_(int((mapping >= 0).sum()))
+        graph.replay()
+        tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-3
+        torch.testing.assert_close(output.cpu(), expected.to(dtype), atol=tolerance, rtol=tolerance)
+
+        # Count changes on the same graph: skip stores, then resume next step.
+        sentinel = torch.randn(batch, heads, dim, generator=generator).to(dtype)
+        sentinel[0, 0, 0] = float("nan")
+        output.copy_(sentinel)
+        count.zero_()
+        graph.replay()
+        torch.testing.assert_close(output.cpu(), sentinel, atol=0, rtol=0, equal_nan=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

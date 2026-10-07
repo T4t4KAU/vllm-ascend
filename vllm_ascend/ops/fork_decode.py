@@ -11,7 +11,13 @@ from vllm_ascend.attention.fork_batch import KERNEL_PAGE_SIZE, MAX_BATCH, MAX_SP
 from vllm_ascend.ops.triton.fork_attention import merge_fork_batch, pack_fork_batch
 from vllm_ascend.utils import weak_ref_tensors
 
-QUERY_COPY_TILE = 1024
+# The serving geometry has 16 x 256 elements per query. Packing a full row
+# avoids four separately scheduled tasks, including for inactive graph rows.
+QUERY_COPY_TILE = 4096
+# Two adjacent heads halve the merge grid while keeping DIM contiguous. The
+# largest FP32 value tile is 32 x 2 x 256 (64 KiB), before compiler temporaries.
+# This is a layout choice, not a measured optimum across NPU generations.
+MERGE_HEAD_TILE = 2
 
 
 class ForkDecodeBuffers:
@@ -122,7 +128,7 @@ class ForkDecodeBuffers:
         )
 
     def merge(self, output):
-        merge_fork_batch[(output.shape[0], self.heads)](
+        merge_fork_batch[(output.shape[0], triton.cdiv(self.heads, MERGE_HEAD_TILE))](
             self.partial,
             self.lse,
             output,
@@ -132,6 +138,7 @@ class ForkDecodeBuffers:
             self.dim,
             self.parts,
             triton.next_power_of_2(self.parts),
+            MERGE_HEAD_TILE,
         )
 
     def run(self, query, key, value, output, metadata, scale):
